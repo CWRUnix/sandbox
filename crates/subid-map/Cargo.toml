@@ -1,0 +1,8 @@
+[package]
+name = "cwrunix-subid-map"
+version = "0.1.0"
+edition = "2021"
+description = "Privileged uid/gid map writer for the CWRUnix login sandbox"
+
+[dependencies]
+libc = "0.2"

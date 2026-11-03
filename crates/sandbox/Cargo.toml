@@ -1,0 +1,8 @@
+[package]
+name = "cwrunix-sandbox"
+version = "0.1.0"
+edition = "2021"
+description = "The CWRUnix member login sandbox (namespace launcher)"
+
+[dependencies]
+libc = "0.2"
