@@ -123,3 +123,28 @@ pub fn park() -> ! {
         std::thread::park();
     }
 }
+
+/// Step timing for debugging (CWRUNIX_DEBUG=1): prints elapsed time since
+/// process start with the login-sandbox prefix.
+pub fn note(msg: impl std::fmt::Display) {
+    use std::sync::OnceLock;
+    static START: OnceLock<Instant> = OnceLock::new();
+    if std::env::var_os("CWRUNIX_DEBUG").is_none() {
+        return;
+    }
+    let start = START.get_or_init(Instant::now);
+    eprintln!(
+        "login-sandbox[{:>7.3}s] {msg}",
+        start.elapsed().as_secs_f64()
+    );
+}
+
+/// Re-arm the parent-death signal. The kernel CLEARS pdeathsig on any
+/// exec that changes the process's privilege level — which our post-map
+/// re-execs (euid 0 in-namespace => caps) are — so every role that gets
+/// its caps via a re-exec must re-arm afterwards.
+pub fn rearm_pdeathsig() {
+    unsafe {
+        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0);
+    }
+}

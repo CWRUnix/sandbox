@@ -1,0 +1,8 @@
+[package]
+name = "cwrunix-jobs"
+version = "0.1.0"
+edition = "2021"
+description = "Per-user background job broker for the CWRUnix login sandbox"
+
+[dependencies]
+libc = "0.2"

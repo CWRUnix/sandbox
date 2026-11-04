@@ -12,9 +12,18 @@ use std::{
     time::Duration,
 };
 
-/// Setuid helper writing the outer namespace's id map (see subid-map.c).
+/// Setuid helper writing the outer namespace's id map (see crates/subid-map).
 /// Created by the server config's security.wrappers entry.
 const HOST_SUBID_MAP: &str = "/run/wrappers/bin/cwrunix-subid-map";
+
+/// The member-visible home inside the sandbox is this subdirectory of their
+/// real home. Unsandboxed contexts (PAM, the systemd user manager, the job
+/// broker) operate on the REAL home, which sandboxed code can therefore
+/// never write — this closes the whole class of "plant a file the
+/// unsandboxed context consumes" attacks (user units in
+/// ~/.config/systemd/user, ~/.pam_environment, ...). Keep in sync with
+/// crates/jobs (HOME_SUBDIR).
+const HOME_SUBDIR: &str = "sandbox";
 
 struct Flags {
     bwrap: PathBuf,
@@ -24,6 +33,8 @@ struct Flags {
     sandbox_profile: String,
     containers_config: String,
     subid_map_bin: PathBuf,
+    systemctl: Option<PathBuf>,
+    jobs_sock: Option<PathBuf>,
     trailing: Vec<OsString>,
 }
 
@@ -36,6 +47,8 @@ fn parse_flags(args: &[OsString]) -> Flags {
         sandbox_profile: String::new(),
         containers_config: String::new(),
         subid_map_bin: PathBuf::new(),
+        systemctl: None,
+        jobs_sock: None,
         trailing: Vec::new(),
     };
     let mut it = args.iter();
@@ -43,7 +56,12 @@ fn parse_flags(args: &[OsString]) -> Flags {
         let Some(s) = arg.to_str() else {
             fail("non-utf8 argument")
         };
-        if s == "--" || !s.starts_with("--") {
+        if s == "--" {
+            // Explicit end-of-flags: the rest is the payload, verbatim.
+            f.trailing = it.cloned().collect();
+            break;
+        }
+        if !s.starts_with("--") {
             // first non-flag: the sshd-style payload invocation begins here
             let mut rest = vec![arg.clone()];
             rest.extend(it.cloned());
@@ -61,6 +79,8 @@ fn parse_flags(args: &[OsString]) -> Flags {
             "--sandbox-profile" => f.sandbox_profile = value.to_string_lossy().into_owned(),
             "--containers-config" => f.containers_config = value.to_string_lossy().into_owned(),
             "--subid-map-bin" => f.subid_map_bin = value.clone().into(),
+            "--systemctl" => f.systemctl = Some(value.clone().into()),
+            "--jobs-sock" => f.jobs_sock = Some(value.clone().into()),
             _ => fail(format!("unknown flag {s}")),
         }
     }
@@ -121,6 +141,10 @@ struct Session {
     gid: u32,
     user: String,
     home: PathBuf,
+    /// What actually gets bound at `home`: the per-member subdirectory of
+    /// the real home (see HOME_SUBDIR).
+    sandbox_home: PathBuf,
+    jobs_sock: Option<PathBuf>,
     etc: PathBuf,
     inner_shell: String,
 }
@@ -216,7 +240,7 @@ impl Session {
             "/nix/var/nix/daemon-socket".into(),
             "/nix/var/nix/daemon-socket".into(),
             "--bind".into(),
-            self.home.to_string_lossy().into_owned(),
+            self.sandbox_home.to_string_lossy().into_owned(),
             self.home.to_string_lossy().into_owned(),
             "--dev-bind-try".into(),
             "/dev/dri".into(),
@@ -224,6 +248,15 @@ impl Session {
             "--tmpfs".into(),
             format!("/run/user/{}", self.uid),
         ]);
+        // The job broker's socket (a plain file bind; connecting needs it
+        // read-write). Absent when the user manager couldn't be reached.
+        if let Some(sock) = &self.jobs_sock {
+            a.extend([
+                "--bind".into(),
+                sock.to_string_lossy().into_owned(),
+                "/run/cwrunix-jobs.ctl".into(),
+            ]);
+        }
         for f in ["passwd", "group", "hosts", "resolv.conf", "nsswitch.conf"] {
             a.extend([
                 "--ro-bind".into(),
@@ -252,6 +285,9 @@ impl Session {
                 "--ro-bind".into(),
                 format!("{}/bin", self.etc.display()),
                 "/etc/cwrunix/bin".into(),
+                "--bind".into(),
+                format!("{}/sock.d", self.etc.display()),
+                "/run/cwrunix-subid.d".into(),
             ]);
         }
         a.extend(resolved.iter().cloned());
@@ -328,15 +364,23 @@ fn write_single_maps(pid: u32, uid: u32, gid: u32) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Wait for the child's fresh user namespace and write its id map: the full
-/// map via the setuid helper, or the single own-id line ourselves. Returns
-/// whether the child got the full map (it detects the mode from its own
-/// map content).
-fn map_child(pid: u32, uid: u32, gid: u32, full: bool) -> bool {
-    if !wait_until(
+/// Wait for the child's fresh user namespace, then write its id map: the
+/// full map via the setuid helper, or the single own-id line ourselves.
+/// Returns true if the child got the full map, false for the single-uid
+/// map, and None if the helper failed mid-write (the caller should kill
+/// and relaunch the child in single-uid mode — a half-written map can
+/// never be repaired, the kernel only allows one write).
+fn map_child(pid: u32, uid: u32, gid: u32, full: bool) -> Option<bool> {
+    let entered = wait_until(
         || ns_differs_from_self(pid, "user") || !pid_alive(pid),
         Duration::from_secs(10),
-    ) {
+    );
+    note(if entered {
+        "child userns observed"
+    } else {
+        "child userns TIMEOUT"
+    });
+    if !entered {
         fail("child never entered its user namespace");
     }
     if full {
@@ -345,17 +389,50 @@ fn map_child(pid: u32, uid: u32, gid: u32, full: bool) -> bool {
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
-        if ok {
-            return true;
-        }
-        eprintln!("login-sandbox: warning: subordinate id mapping failed; using single-uid sandbox");
+        return if ok { Some(true) } else { None };
     }
     write_single_maps(pid, uid, gid).unwrap_or_else(|e| io_fail(format!("writing id map: {e}")));
-    false
+    Some(false)
 }
 
 fn write(path: impl AsRef<Path>, content: impl AsRef<str>) {
     fs::write(path, content.as_ref()).unwrap_or_else(|e| io_fail(format!("writing: {e}")));
+}
+
+/// Bring up the per-user job broker socket (best-effort; jobs are simply
+/// unavailable in this session when the user manager can't be reached) and
+/// return the path to bind into the sandbox. daemon-reload picks up unit
+/// files deployed after the manager started.
+fn setup_jobs_socket(flags: &Flags) -> Option<PathBuf> {
+    let sock = flags.jobs_sock.clone()?;
+    let systemctl = flags.systemctl.clone()?;
+    for action in ["daemon-reload", "start"] {
+        let mut cmd = Command::new(&systemctl);
+        cmd.arg("--user").arg(action);
+        if action == "start" {
+            cmd.arg("cwrunix-jobsd.socket");
+        }
+        let ok = cmd
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            eprintln!(
+                "login-sandbox: warning: job broker unavailable (systemctl --user {action} failed)"
+            );
+            return None;
+        }
+    }
+    let ok = sock.exists();
+    note(if ok {
+        "job broker socket up"
+    } else {
+        "job broker socket missing"
+    });
+    if ok { Some(sock) } else { None }
 }
 
 pub fn main(args: &[OsString]) -> ExitCode {
@@ -374,15 +451,37 @@ pub fn main(args: &[OsString]) -> ExitCode {
             home.display()
         ));
     }
+    // The member-visible home is a fixed subdirectory of the real home
+    // (HOME_SUBDIR). Create it on first login; refuse anything that isn't
+    // a plain member-owned directory.
+    let sandbox_home = home.join(HOME_SUBDIR);
+    {
+        use std::os::unix::fs::MetadataExt;
+        match fs::symlink_metadata(&sandbox_home) {
+            Ok(m) if m.file_type().is_dir() && m.uid() == uid => {}
+            Ok(_) => fail(format!(
+                "{} is not a member-owned directory",
+                sandbox_home.display()
+            )),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&sandbox_home)
+                    .unwrap_or_else(|e| io_fail(format!("creating {}: {e}", sandbox_home.display())));
+            }
+            Err(e) => io_fail(format!("stat {}: {e}", sandbox_home.display())),
+        }
+    }
     let group = group_name(gid).unwrap_or_else(|| "users".into());
 
     let inner_shell = format!("{}/bin/zsh", flags.sandbox_profile);
-    let payload: Vec<OsString> = if flags.trailing.first().map(|a| a.as_os_str()) == Some(OsStr::new("-c"))
-    {
-        let cmd = flags.trailing.get(1).cloned().unwrap_or_default();
-        vec![OsString::from(&inner_shell), "-c".into(), cmd]
-    } else {
-        vec![OsString::from(&inner_shell), "-l".into()]
+    let payload: Vec<OsString> = match flags.trailing.split_first() {
+        // sshd-style: a bare "-c <cmd>" invocation goes through the shell.
+        Some((a, rest)) if a.as_os_str() == OsStr::new("-c") => {
+            let cmd = rest.first().cloned().unwrap_or_default();
+            vec![OsString::from(&inner_shell), "-c".into(), cmd]
+        }
+        // Anything else (e.g. from the job broker) is exec'd verbatim.
+        Some(_) => flags.trailing.clone(),
+        None => vec![OsString::from(&inner_shell), "-l".into()],
     };
 
     // Per-session /etc + FUSE staging + handshake dir, cleaned up by logind
@@ -417,17 +516,15 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let mut full = subids_available(uid, gid);
     if full {
         // podman's view of the subid space: the container range lives at
-        // 65536 in the payload namespace (see subid-map.c's map layout).
-        write(
-            etc.join("subuid"),
-            format!("{user}:65536:65536\n{uid}:65536:65536\n"),
-        );
-        write(
-            etc.join("subgid"),
-            format!("{group}:65536:65536\n{gid}:65536:65536\n"),
-        );
+        // 65536 in the payload namespace (see subid-map's map layout).
+        // Only the USERNAME line: tools that also fall back to uid-based
+        // lookups (podman) would otherwise merge both entries and
+        // double-allocate the range.
+        write(etc.join("subuid"), format!("{user}:65536:65536\n"));
+        write(etc.join("subgid"), format!("{group}:65536:65536\n"));
         fs::create_dir(etc.join("bin")).unwrap_or_else(|e| io_fail(format!("mkdir: {e}")));
         fs::create_dir(etc.join("uidmap")).unwrap_or_else(|e| io_fail(format!("mkdir: {e}")));
+        fs::create_dir(etc.join("sock.d")).unwrap_or_else(|e| io_fail(format!("mkdir: {e}")));
     }
 
     let session = Session {
@@ -435,6 +532,8 @@ pub fn main(args: &[OsString]) -> ExitCode {
         gid,
         user,
         home,
+        sandbox_home,
+        jobs_sock: setup_jobs_socket(&flags),
         etc,
         inner_shell,
     };
@@ -442,16 +541,36 @@ pub fn main(args: &[OsString]) -> ExitCode {
 
     loop {
         let bwrap_args = session.bwrap_args(&flags, full, &resolved);
+        note(if full { "spawning (multi-uid)" } else { "spawning (single-uid)" });
         let mut child = spawn_netns(&flags, &session.etc, &session, &bwrap_args, &payload, full);
         let pid = child.id();
-        let child_full = map_child(pid, uid, gid, full);
+        let child_full = match map_child(pid, uid, gid, full) {
+            Some(f) => {
+                note(if f { "map: full" } else { "map: single" });
+                f
+            }
+            None => {
+                // The setuid helper failed mid-map (the map can never be
+                // half-repaired): kill this child and relaunch single-uid.
+                eprintln!("login-sandbox: warning: subordinate id mapping failed; using single-uid sandbox");
+                let _ = child.kill();
+                let _ = child.wait();
+                full = false;
+                continue;
+            }
+        };
 
         // slirp4netns must attach after the child actually entered its net
         // namespace (else it grabs the HOST netns handle and fails).
-        wait_until(
+        let net_ready = wait_until(
             || ns_differs_from_self(pid, "net") || !pid_alive(pid),
             Duration::from_secs(10),
         );
+        note(if net_ready {
+            "netns observed"
+        } else {
+            "netns TIMEOUT"
+        });
         let mut slirp_cmd = Command::new(&flags.slirp4netns);
         slirp_cmd
             .args(["--mtu=65520", "--disable-host-loopback"])
@@ -473,6 +592,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
             .unwrap_or_else(|e| io_fail(format!("spawning slirp4netns: {e}")));
 
         let status = child.wait();
+        note("child exited");
         let _ = slirp.kill();
 
         // Full-mode setup can fail before bwrap starts (e.g. a kernel that

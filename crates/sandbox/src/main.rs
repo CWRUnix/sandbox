@@ -24,13 +24,14 @@ fn main() -> ExitCode {
     let _argv0 = argv.next();
     let args: Vec<_> = argv.collect();
     let Some(role) = args.first().and_then(|a| a.to_str()) else {
-        util::fail("usage: cwrunix-sandbox <login|netns-setup|holder-u2|holder> ...");
+        util::fail("usage: cwrunix-sandbox <login|netns-setup|holder-u2|holder|map-agent> ...");
     };
     match role {
         "login" => login::main(&args[1..]),
         "netns-setup" => netns::main(&args[1..]),
         "holder-u2" => netns::holder_u2(&args[1..]),
         "holder" => util::park(),
+        "map-agent" => netns::map_agent(),
         other => util::fail(format!("unknown role '{other}'")),
     }
 }
